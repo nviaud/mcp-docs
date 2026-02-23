@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "docs": {
+      "command": "node",
+      "args": ["dist/index.js"],
+      "env": {
+        "DOCS_DIR": "./docs",
+        "VECTOR_SEARCH": "false"
+      }
+    }
+  }
+}
