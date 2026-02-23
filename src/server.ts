@@ -2,8 +2,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import type { DocsIndexer } from "./indexer.js";
+import type { GuidesLoader } from "./guides.js";
 
-export async function startServer(indexer: DocsIndexer): Promise<void> {
+export async function startServer(
+  indexer: DocsIndexer,
+  guidesLoader: GuidesLoader
+): Promise<void> {
   const server = new McpServer({
     name: "mcp-docs",
     version: "1.0.0",
@@ -138,11 +142,108 @@ export async function startServer(indexer: DocsIndexer): Promise<void> {
       }
 
       const list = docs
-        .map((d) => `- \`${d.path}\` — ${d.title}`)
+        .map((d) => {
+          const tagStr = d.tags.length > 0 ? `  \`[${d.tags.join(", ")}]\`` : "";
+          return `- \`${d.path}\` — ${d.title}${tagStr}`;
+        })
         .join("\n");
 
       return {
         content: [{ type: "text", text: `# Documentation Index\n\n${list}` }],
+      };
+    }
+  );
+
+  // ------------------------------------------------------------------
+  // Tool: list_guides
+  // Returns all available guides (id, title, description).
+  // ------------------------------------------------------------------
+  server.registerTool(
+    "list_guides",
+    {
+      description:
+        "List all available guides. A guide bundles several documentation pages together with AI instructions for a specific developer task (e.g. building a Docker image). Use get_guide to retrieve the full content of a guide.",
+      inputSchema: {},
+    },
+    async () => {
+      const guides = guidesLoader.list();
+
+      if (guides.length === 0) {
+        return {
+          content: [{ type: "text", text: "No guides available." }],
+        };
+      }
+
+      const list = guides
+        .map((g) => {
+          const tagStr = g.tags.length > 0 ? ` \`[${g.tags.join(", ")}]\`` : "";
+          return `- **${g.id}** — ${g.title}${tagStr}\n  ${g.description}`;
+        })
+        .join("\n\n");
+
+      return {
+        content: [{ type: "text", text: `# Available Guides\n\n${list}` }],
+      };
+    }
+  );
+
+  // ------------------------------------------------------------------
+  // Tool: get_guide
+  // Searches docs scoped to the guide's tags, prepends its instructions.
+  // ------------------------------------------------------------------
+  server.registerTool(
+    "get_guide",
+    {
+      description:
+        "Retrieve a guide by its id. Returns AI instructions and the full content of all documentation pages bundled in that guide. Use list_guides to discover available ids.",
+      inputSchema: {
+        id: z
+          .string()
+          .min(1)
+          .describe('Guide id, e.g. "docker-build". Use list_guides to see all available ids.'),
+        query: z
+          .string()
+          .min(1)
+          .describe("Your specific task or question within the guide's domain"),
+        top_k: z
+          .number()
+          .int()
+          .min(1)
+          .max(20)
+          .default(5)
+          .describe("Number of documents to include (default: 5)"),
+      },
+    },
+    async ({ id, query, top_k }) => {
+      const guide = guidesLoader.get(id);
+
+      if (!guide) {
+        return {
+          content: [{ type: "text", text: `Guide not found: ${id}` }],
+          isError: true,
+        };
+      }
+
+      const filterTags = guide.tags.length > 0 ? guide.tags : undefined;
+      const results = await indexer.search(query, top_k ?? 5, filterTags);
+
+      const parts: string[] = [];
+
+      parts.push(`## Instructions\n\n${guide.instructions}`);
+
+      if (results.length === 0) {
+        parts.push("---\n\n*No relevant documents found for this query.*");
+      } else {
+        for (const result of results) {
+          const doc = indexer.getDoc(result.path);
+          if (doc) {
+            parts.push(`---\n\n## Document: ${result.title}\n\n${doc.content}`);
+          }
+        }
+      }
+
+      return {
+        content: [{ type: "text", text: parts.join("\n\n") }],
       };
     }
   );

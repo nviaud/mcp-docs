@@ -1,8 +1,27 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join, relative, extname } from "node:path";
 import { create, insert, search, count, type AnyOrama } from "@orama/orama";
+import { parse as parseYaml } from "yaml";
 import OpenAI from "openai";
 import type { DocRecord, SearchResult, IndexerConfig } from "./types.js";
+
+// ---------------------------------------------------------------------------
+// Frontmatter parser
+// ---------------------------------------------------------------------------
+
+interface Frontmatter {
+  title?: string;
+  description?: string;
+  tags?: string[];
+}
+
+/** Splits the YAML frontmatter fence from the markdown body and parses it. */
+function parseFrontmatter(raw: string): { data: Frontmatter; body: string } {
+  const match = raw.match(/^---\r?\n([\s\S]*?)\n---\r?\n?/);
+  if (!match) return { data: {}, body: raw };
+  const data = parseYaml(match[1]) as Frontmatter ?? {};
+  return { data, body: raw.slice(match[0].length) };
+}
 
 // ---------------------------------------------------------------------------
 // Schema helpers
@@ -16,6 +35,7 @@ function makeTextSchema() {
       path: "string",
       title: "string",
       content: "string",
+      tags: "enum[]",
     } as const,
   });
 }
@@ -28,6 +48,7 @@ function makeVectorSchema(dimensions: number) {
       path: "string",
       title: "string",
       content: "string",
+      tags: "enum[]",
       embedding: `vector[${dimensions}]` as `vector[${number}]`,
     } as const,
   });
@@ -54,11 +75,10 @@ async function findMarkdownFiles(dir: string): Promise<string[]> {
   return files;
 }
 
-/** Extract the first H1 heading from markdown content, or fall back to filename */
-function extractTitle(content: string, filePath: string): string {
-  const match = content.match(/^#\s+(.+)$/m);
+/** Extract the first H1 heading from markdown body, or fall back to filename */
+function extractTitle(body: string, filePath: string): string {
+  const match = body.match(/^#\s+(.+)$/m);
   if (match) return match[1].trim();
-  // Fallback: use filename without extension
   const parts = filePath.split(/[\\/]/);
   return parts[parts.length - 1].replace(/\.md$/, "");
 }
@@ -72,13 +92,10 @@ async function generateEmbeddings(
   openai: OpenAI,
   model: string
 ): Promise<number[][]> {
-  // OpenAI supports batching up to 2048 inputs per request
   const response = await openai.embeddings.create({
     model,
     input: texts,
   });
-
-  // Results are returned in the same order as inputs
   return response.data
     .sort((a, b) => a.index - b.index)
     .map((d) => d.embedding);
@@ -113,16 +130,20 @@ export class DocsIndexer {
 
     console.error(`[indexer] Found ${files.length} markdown file(s)`);
 
-    // Read all files
+    // Read all files and parse frontmatter
     const docs: DocRecord[] = await Promise.all(
       files.map(async (filePath) => {
-        const content = await readFile(filePath, "utf-8");
+        const raw = await readFile(filePath, "utf-8");
+        const { data, body } = parseFrontmatter(raw);
         const path = relative(this.config.docsDir, filePath).replace(/\\/g, "/");
+
         return {
           id: path,
           path,
-          title: extractTitle(content, path),
-          content,
+          content: raw,
+          title: data.title ?? extractTitle(body, path),
+          description: data.description ?? "",
+          tags: data.tags ?? [],
         };
       })
     );
@@ -149,9 +170,19 @@ export class DocsIndexer {
       ? await makeVectorSchema(this.config.embeddingDimensions)
       : await makeTextSchema();
 
-    // Insert all documents and populate the store
+    // Insert all documents — use body (without frontmatter) for the content field
+    // so frontmatter YAML doesn't pollute full-text search
     for (const doc of docs) {
-      await insert(db, doc as unknown as Record<string, unknown>);
+      const { body } = parseFrontmatter(doc.content);
+      await insert(db, {
+        id: doc.id,
+        path: doc.path,
+        title: doc.title,
+        content: body,
+        tags: doc.tags,
+        ...(doc.embedding ? { embedding: doc.embedding } : {}),
+      } as unknown as Record<string, unknown>);
+
       this.docStore.set(doc.path, doc);
     }
 
@@ -161,44 +192,77 @@ export class DocsIndexer {
     console.error(`[indexer] Index ready — ${total} document(s) indexed`);
   }
 
-  /** Search the index. Uses hybrid search when vector search is enabled. */
+  /**
+   * Search the index.
+   * When filterTags is provided, one Orama query is issued per tag using the
+   * native `where: { tags: { containsAll: [tag] } }` filter (OR semantics:
+   * results from all per-tag searches are merged and re-ranked by score).
+   * No post-filtering — Orama only scans the matching subset for each query.
+   */
   async search(
     query: string,
-    topK = 5
+    topK = 5,
+    filterTags?: string[]
   ): Promise<SearchResult[]> {
     if (!this.db) throw new Error("Index not built yet. Call build() first.");
 
-    let hits: Array<{ document: Record<string, unknown>; score: number }> = [];
+    const tags = filterTags && filterTags.length > 0 ? filterTags : null;
 
-    if (this.config.vectorSearch && this.openai) {
-      // Embed the query, then run vector search
-      const [queryEmbedding] = await generateEmbeddings(
-        [query],
-        this.openai,
-        this.config.embeddingModel
-      );
+    // Build the base search params (without where), then extend per tag.
+    // Using unknown cast because AnyOrama loosens the generic typed overloads.
+    type Hit = { document: Record<string, unknown>; score: number };
 
-      const results = await search(this.db, {
-        mode: "hybrid",
-        term: query,
-        vector: {
-          value: queryEmbedding,
-          property: "embedding",
-        },
-        limit: topK,
-      });
+    const runSearch = async (where?: Record<string, unknown>): Promise<Hit[]> => {
+      if (this.config.vectorSearch && this.openai) {
+        const [queryEmbedding] = await generateEmbeddings(
+          [query],
+          this.openai,
+          this.config.embeddingModel
+        );
+        const results = await search(this.db!, {
+          mode: "hybrid",
+          term: query,
+          vector: { value: queryEmbedding, property: "embedding" },
+          limit: topK,
+          ...(where ? { where } : {}),
+        } as unknown as Parameters<typeof search>[1]);
+        return results.hits as Hit[];
+      } else {
+        const results = await search(this.db!, {
+          mode: "fulltext",
+          term: query,
+          properties: ["title", "content"],
+          limit: topK,
+          ...(where ? { where } : {}),
+        } as unknown as Parameters<typeof search>[1]);
+        return results.hits as Hit[];
+      }
+    };
 
-      hits = results.hits as typeof hits;
+    let hits: Hit[];
+
+    if (!tags) {
+      // No tag filter — single search across all docs
+      hits = await runSearch();
     } else {
-      // Full-text search only
-      const results = await search(this.db, {
-        mode: "fulltext",
-        term: query,
-        properties: ["title", "content"],
-        limit: topK,
-      });
-
-      hits = results.hits as typeof hits;
+      // One search per tag (OR semantics). Merge by path, keep highest score.
+      const byPath = new Map<string, Hit>();
+      await Promise.all(
+        tags.map(async (tag) => {
+          const tagHits = await runSearch({ tags: { containsAll: [tag] } });
+          for (const hit of tagHits) {
+            const path = hit.document["path"] as string;
+            const existing = byPath.get(path);
+            if (!existing || hit.score > existing.score) {
+              byPath.set(path, hit);
+            }
+          }
+        })
+      );
+      // Re-sort merged results by score descending, take topK
+      hits = Array.from(byPath.values())
+        .sort((a, b) => b.score - a.score)
+        .slice(0, topK);
     }
 
     return hits.map(({ document, score }) => ({
@@ -214,11 +278,12 @@ export class DocsIndexer {
     return this.docStore.get(path);
   }
 
-  /** List all indexed document paths */
-  listDocs(): Array<{ path: string; title: string }> {
-    return Array.from(this.docStore.values()).map(({ path, title }) => ({
+  /** List all indexed document paths with their titles and tags */
+  listDocs(): Array<{ path: string; title: string; tags: string[] }> {
+    return Array.from(this.docStore.values()).map(({ path, title, tags }) => ({
       path,
       title,
+      tags,
     }));
   }
 
@@ -236,7 +301,6 @@ export class DocsIndexer {
     let hits: Array<{ document: Record<string, unknown>; score: number }> = [];
 
     if (this.config.vectorSearch && this.openai && doc.embedding) {
-      // Re-use the pre-computed embedding — no extra API call needed
       const results = await search(this.db, {
         mode: "hybrid",
         term: doc.title,
@@ -244,7 +308,7 @@ export class DocsIndexer {
           value: doc.embedding,
           property: "embedding",
         },
-        limit: topK + 1, // +1 so we can drop the doc itself
+        limit: topK + 1,
       });
       hits = results.hits as typeof hits;
     } else {

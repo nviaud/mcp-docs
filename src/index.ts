@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { DocsIndexer } from "./indexer.js";
+import { GuidesLoader } from "./guides.js";
 import { startServer } from "./server.js";
 
 // ---------------------------------------------------------------------------
@@ -10,6 +11,11 @@ import { startServer } from "./server.js";
 const DOCS_DIR = process.env.DOCS_DIR
   ? resolve(process.env.DOCS_DIR)
   : resolve("./docs");
+
+/** Absolute path to your guides directory */
+const GUIDES_DIR = process.env.GUIDES_DIR
+  ? resolve(process.env.GUIDES_DIR)
+  : resolve("./guides");
 
 /**
  * Set VECTOR_SEARCH=true to enable vector (semantic) search.
@@ -43,6 +49,7 @@ async function main() {
   }
 
   console.error(`[config] docs dir    : ${DOCS_DIR}`);
+  console.error(`[config] guides dir  : ${GUIDES_DIR}`);
   console.error(`[config] vector search: ${VECTOR_SEARCH}`);
   if (VECTOR_SEARCH) {
     console.error(`[config] embedding model: ${EMBEDDING_MODEL} (${EMBEDDING_DIMENSIONS} dims)`);
@@ -55,8 +62,11 @@ async function main() {
     embeddingDimensions: EMBEDDING_DIMENSIONS,
   });
 
+  const guidesLoader = new GuidesLoader(GUIDES_DIR);
+
   await indexer.build();
-  await startServer(indexer);
+  await guidesLoader.load();
+  await startServer(indexer, guidesLoader);
 }
 
 main().catch((err) => {

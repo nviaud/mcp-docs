@@ -1,3 +1,9 @@
+---
+title: "Authentication"
+description: "How to authenticate API requests using API keys"
+tags: [authentication, api-keys, security]
+---
+
 # Authentication
 
 The platform uses API keys for authentication. All requests must include your API key.

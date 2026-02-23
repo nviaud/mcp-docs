@@ -1,3 +1,9 @@
+---
+title: "Quickstart Guide"
+description: "Get up and running with the platform in minutes"
+tags: [quickstart, getting-started, sdk]
+---
+
 # Quickstart Guide
 
 Welcome to the platform! This guide will get you up and running in minutes.

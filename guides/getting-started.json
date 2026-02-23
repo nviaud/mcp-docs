@@ -1,0 +1,7 @@
+{
+  "id": "getting-started",
+  "title": "Getting Started with the Platform",
+  "description": "Onboarding guide covering SDK setup and authentication",
+  "instructions": "Always use the latest version of the SDK. API keys must never be hardcoded — use environment variables. When showing authentication examples, prefer the SDK constructor over raw HTTP headers.",
+  "tags": ["getting-started", "quickstart", "authentication", "sdk"]
+}
