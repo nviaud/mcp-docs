@@ -75,9 +75,16 @@ export async function startServer(indexer: DocsIndexer): Promise<void> {
           .describe(
             'Relative path of the doc file, e.g. "guides/quickstart.md"'
           ),
+        related_top_k: z
+          .number()
+          .int()
+          .min(0)
+          .max(10)
+          .default(3)
+          .describe("Number of related documents to include (default: 3, set to 0 to disable)"),
       },
     },
-    async ({ path }) => {
+    async ({ path, related_top_k }) => {
       const doc = indexer.getDoc(path);
 
       if (!doc) {
@@ -87,8 +94,26 @@ export async function startServer(indexer: DocsIndexer): Promise<void> {
         };
       }
 
+      const topK = related_top_k ?? 3;
+      let text = doc.content;
+
+      if (topK > 0) {
+        const related = await indexer.findRelated(path, topK);
+
+        if (related.length > 0) {
+          const relatedSection = related
+            .map(
+              (r) =>
+                `- \`${r.path}\` — **${r.title}**\n  ${r.excerpt}${r.excerpt.length === 300 ? "…" : ""}`
+            )
+            .join("\n\n");
+
+          text += `\n\n---\n\n## Related documents\n\n${relatedSection}`;
+        }
+      }
+
       return {
-        content: [{ type: "text", text: doc.content }],
+        content: [{ type: "text", text }],
       };
     }
   );

@@ -221,4 +221,50 @@ export class DocsIndexer {
       title,
     }));
   }
+
+  /**
+   * Find documents related to the given path.
+   * Uses the stored embedding (vector mode) or the doc's title (text mode).
+   * The source document is excluded from results.
+   */
+  async findRelated(path: string, topK = 3): Promise<SearchResult[]> {
+    if (!this.db) throw new Error("Index not built yet. Call build() first.");
+
+    const doc = this.docStore.get(path);
+    if (!doc) return [];
+
+    let hits: Array<{ document: Record<string, unknown>; score: number }> = [];
+
+    if (this.config.vectorSearch && this.openai && doc.embedding) {
+      // Re-use the pre-computed embedding — no extra API call needed
+      const results = await search(this.db, {
+        mode: "hybrid",
+        term: doc.title,
+        vector: {
+          value: doc.embedding,
+          property: "embedding",
+        },
+        limit: topK + 1, // +1 so we can drop the doc itself
+      });
+      hits = results.hits as typeof hits;
+    } else {
+      const results = await search(this.db, {
+        mode: "fulltext",
+        term: doc.title,
+        properties: ["title", "content"],
+        limit: topK + 1,
+      });
+      hits = results.hits as typeof hits;
+    }
+
+    return hits
+      .filter(({ document }) => (document["path"] as string) !== path)
+      .slice(0, topK)
+      .map(({ document, score }) => ({
+        path: document["path"] as string,
+        title: document["title"] as string,
+        excerpt: (document["content"] as string).slice(0, 300).trimEnd(),
+        score,
+      }));
+  }
 }
