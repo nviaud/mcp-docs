@@ -1,12 +1,15 @@
 import { readdir, readFile } from "node:fs/promises";
-import { join, relative, extname } from "node:path";
+import { join, relative, extname, basename } from "node:path";
 import { create, insert, search, count, type AnyOrama } from "@orama/orama";
+import { unified } from "unified";
+import remarkParse from "remark-parse";
+import remarkFrontmatter from "remark-frontmatter";
 import { parse as parseYaml } from "yaml";
 import OpenAI from "openai";
 import type { DocRecord, SearchResult, IndexerConfig } from "./types.js";
 
 // ---------------------------------------------------------------------------
-// Frontmatter parser
+// Markdown parser
 // ---------------------------------------------------------------------------
 
 interface Frontmatter {
@@ -15,12 +18,20 @@ interface Frontmatter {
   tags?: string[];
 }
 
-/** Splits the YAML frontmatter fence from the markdown body and parses it. */
-function parseFrontmatter(raw: string): { data: Frontmatter; body: string } {
-  const match = raw.match(/^---\r?\n([\s\S]*?)\n---\r?\n?/);
-  if (!match) return { data: {}, body: raw };
-  const data = parseYaml(match[1]) as Frontmatter ?? {};
-  return { data, body: raw.slice(match[0].length) };
+type YamlNode = { type: "yaml"; value: string; position: { end: { offset: number } } };
+
+const mdProcessor = unified().use(remarkParse).use(remarkFrontmatter);
+
+/** Parses a raw markdown file into structured metadata and a clean body. */
+function parseDoc(raw: string, filePath: string): { data: Frontmatter; title: string; body: string } {
+  const tree = mdProcessor.parse(raw);
+
+  const yamlNode = tree.children.find((n) => n.type === "yaml") as YamlNode | undefined;
+  const data: Frontmatter = yamlNode ? (parseYaml(yamlNode.value) as Frontmatter ?? {}) : {};
+  const body = yamlNode ? raw.slice(yamlNode.position.end.offset) : raw;
+  const title = data.title ?? basename(filePath, ".md");
+
+  return { data, title, body };
 }
 
 // ---------------------------------------------------------------------------
@@ -75,14 +86,6 @@ async function findMarkdownFiles(dir: string): Promise<string[]> {
   return files;
 }
 
-/** Extract the first H1 heading from markdown body, or fall back to filename */
-function extractTitle(body: string, filePath: string): string {
-  const match = body.match(/^#\s+(.+)$/m);
-  if (match) return match[1].trim();
-  const parts = filePath.split(/[\\/]/);
-  return parts[parts.length - 1].replace(/\.md$/, "");
-}
-
 // ---------------------------------------------------------------------------
 // Embedding helper
 // ---------------------------------------------------------------------------
@@ -130,18 +133,18 @@ export class DocsIndexer {
 
     console.error(`[indexer] Found ${files.length} markdown file(s)`);
 
-    // Read all files and parse frontmatter
+    // Read all files and parse frontmatter + title via remark
     const docs: DocRecord[] = await Promise.all(
       files.map(async (filePath) => {
         const raw = await readFile(filePath, "utf-8");
-        const { data, body } = parseFrontmatter(raw);
         const path = relative(this.config.docsDir, filePath).replace(/\\/g, "/");
+        const { data, title, body: _body } = parseDoc(raw, path);
 
         return {
           id: path,
           path,
           content: raw,
-          title: data.title ?? extractTitle(body, path),
+          title,
           description: data.description ?? "",
           tags: data.tags ?? [],
         };
@@ -173,7 +176,7 @@ export class DocsIndexer {
     // Insert all documents — use body (without frontmatter) for the content field
     // so frontmatter YAML doesn't pollute full-text search
     for (const doc of docs) {
-      const { body } = parseFrontmatter(doc.content);
+      const { body } = parseDoc(doc.content, doc.path);
       await insert(db, {
         id: doc.id,
         path: doc.path,
